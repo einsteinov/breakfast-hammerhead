@@ -88,6 +88,7 @@ struct max17048_chip {
 	int batt_current;
 	int uvlo_thr_mv;
 	int poll_interval_ms;
+	int chg_limit;
 };
 
 static struct max17048_chip *ref;
@@ -229,7 +230,7 @@ static int max17048_get_capacity_from_soc(struct max17048_chip *chip)
 	batt_soc = (batt_soc - (chip->empty_soc * 1000000))
 			/ ((chip->full_soc - chip->empty_soc) * 10000);
 
-	batt_soc = bound_check(100, 0, batt_soc);
+	batt_soc = bound_check(chip->chg_limit, 0, batt_soc);
 
 	return batt_soc;
 }
@@ -259,7 +260,7 @@ static int max17048_check_recharge(struct max17048_chip *chip)
 		return false;
 
 	chg_status = max17048_get_prop_status(chip);
-	if (chip->capacity_level <= 99 &&
+	if (chip->capacity_level < chip->chg_limit &&
 			chg_status == POWER_SUPPLY_STATUS_NOT_CHARGING) {
 		chip->ac_psy->set_property(chip->ac_psy,
 				POWER_SUPPLY_PROP_CHARGING_ENABLED,
@@ -488,6 +489,36 @@ ssize_t max17048_store_status(struct device *dev,
 }
 DEVICE_ATTR(fuelrst, 0664, NULL, max17048_store_status);
 
+static ssize_t show_chg_limit(struct device *dev,
+			      struct device_attribute *attr,
+			      char *buf)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct max17048_chip *chip = i2c_get_clientdata(client);
+
+	return scnprintf(buf, sizeof(s32) * 8 + 1, "%d\n", chip->chg_limit);
+}
+
+static ssize_t store_chg_limit(struct device *dev,
+			       struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct max17048_chip *chip = i2c_get_clientdata(client);
+	int ret, val;
+
+	ret = kstrtoint(buf, 10, &val);
+	if (ret || val < 1 || val > 100)
+		return -EINVAL;
+
+	chip->chg_limit = val;
+
+	return count;
+}
+
+static DEVICE_ATTR(chg_limit, S_IRUGO | S_IWUSR,
+		show_chg_limit, store_chg_limit);
+
 static int max17048_parse_dt(struct device *dev,
 		struct max17048_chip *chip)
 {
@@ -576,6 +607,13 @@ static int max17048_parse_dt(struct device *dev,
 				   &chip->uvlo_thr_mv);
 	if (ret) {
 		pr_err("%s: failed to read uvlo threshold\n", __func__);
+		goto out;
+	}
+
+	ret = of_property_read_u32(dev_node, "max17048,chg_limit",
+				   &chip->chg_limit);
+	if (ret) {
+		pr_err("%s: failed to read charging limit\n", __func__);
 		goto out;
 	}
 
@@ -979,11 +1017,12 @@ static int max17048_probe(struct i2c_client *client,
 
 	disable_irq(chip->alert_irq);
 
-	ret = device_create_file(&client->dev, &dev_attr_fuelrst);
+	ret  = device_create_file(&client->dev, &dev_attr_fuelrst);
+	ret |= device_create_file(&client->dev, &dev_attr_chg_limit);
 	if (ret) {
-		pr_err("%s: fuelrst creation failed: %d\n", __func__, ret);
+		pr_err("%s: attributes creation failed: %d\n", __func__, ret);
 		ret = -ENODEV;
-		goto err_create_file_fuelrst;
+		goto err_create_dev_attrs;
 	}
 
 	ret = max17048_create_debugfs_entries(chip);
@@ -1014,8 +1053,9 @@ static int max17048_probe(struct i2c_client *client,
 err_hw_init:
 	debugfs_remove_recursive(chip->dent);
 err_create_debugfs:
+	device_remove_file(&client->dev, &dev_attr_chg_limit);
 	device_remove_file(&client->dev, &dev_attr_fuelrst);
-err_create_file_fuelrst:
+err_create_dev_attrs:
 	disable_irq_wake(chip->alert_irq);
 err_request_wakeup_irq:
 	free_irq(chip->alert_irq, NULL);
@@ -1036,6 +1076,7 @@ static int max17048_remove(struct i2c_client *client)
 
 	unregister_pm_notifier(&chip->pm_notifier);
 	debugfs_remove_recursive(chip->dent);
+	device_remove_file(&client->dev, &dev_attr_chg_limit);
 	device_remove_file(&client->dev, &dev_attr_fuelrst);
 	disable_irq_wake(chip->alert_irq);
 	free_irq(chip->alert_irq, NULL);
