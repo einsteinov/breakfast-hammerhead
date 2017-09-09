@@ -801,6 +801,15 @@ static ssize_t fsg_show_nofua(struct device *dev, struct device_attribute *attr,
 	return sprintf(buf, "%u\n", curlun->nofua);
 }
 
+static ssize_t fsg_show_cdrom(struct device *dev,
+			      struct device_attribute *attr,
+			      char *buf)
+{
+	struct fsg_lun *curlun = fsg_lun_from_dev(dev);
+
+	return scnprintf(buf, sizeof(u32) + 1, "%u\n", curlun->cdrom);
+}
+
 #ifdef CONFIG_USB_MSC_PROFILING
 static ssize_t fsg_show_perf(struct device *dev, struct device_attribute *attr,
 			      char *buf)
@@ -955,4 +964,30 @@ static ssize_t fsg_store_file(struct device *dev, struct device_attribute *attr,
 	}
 	up_write(filesem);
 	return (rc < 0 ? rc : count);
+}
+
+static ssize_t fsg_store_cdrom(struct device *dev,
+			       struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct fsg_lun *curlun = fsg_lun_from_dev(dev);
+	struct rw_semaphore *filesem = dev_get_drvdata(dev);
+	int ret;
+	u32 val;
+
+	ret = kstrtouint(buf, 2, &val);
+	if (ret || val == curlun->cdrom)
+		return -EINVAL;
+
+	down_read(filesem);
+	if (fsg_lun_is_open(curlun)) {
+		ret = -EBUSY;
+		LDBG(curlun, "LUN is busy. CD-ROM mode is %u\n", curlun->cdrom);
+	} else {
+		curlun->cdrom = val;
+		LDBG(curlun, "CD-ROM mode was changed to %u\n", curlun->cdrom);
+	}
+	up_read(filesem);
+
+	return (ret < 0 ? ret : count);
 }
