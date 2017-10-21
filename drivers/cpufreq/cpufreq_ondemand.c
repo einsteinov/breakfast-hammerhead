@@ -17,9 +17,14 @@
 #include "cpufreq_governor.h"
 
 #define DEF_FREQUENCY_UP_THRESHOLD		(80)
-#define DEF_FREQUENCY_SYNCHRONIZATION		(1)
 #define DEF_SAMPLING_DOWN_FACTOR		(1)
 #define MICRO_FREQUENCY_UP_THRESHOLD		(95)
+
+#ifndef CONFIG_CPU_BOOST
+#define DEF_FREQUENCY_SYNCHRONIZATION		(1)
+#else
+#define DEF_FREQUENCY_SYNCHRONIZATION		(0)
+#endif
 
 struct dbs_work_struct {
 	struct work_struct work;
