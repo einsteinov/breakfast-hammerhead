@@ -1,222 +1,222 @@
-
 /*
- *  linux/drivers/cpufreq/cpufreq_userspace.c
+ * Copyright (C) 2001, Russell King.
+ * Copyright (C) 2002-2004, Dominik Brodowski <linux@brodo.de>
  *
- *  Copyright (C)  2001 Russell King
- *            (C)  2002 - 2004 Dominik Brodowski <linux@brodo.de>
+ * This software is licensed under the terms of the GNU General Public
+ * License version 2, as published by the Free Software Foundation, and
+ * may be copied, distributed, and modified under those terms.
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
  */
 
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/smp.h>
-#include <linux/init.h>
-#include <linux/spinlock.h>
-#include <linux/interrupt.h>
+#define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
+
 #include <linux/cpufreq.h>
-#include <linux/cpu.h>
-#include <linux/types.h>
-#include <linux/fs.h>
-#include <linux/sysfs.h>
-#include <linux/mutex.h>
+#include <linux/module.h>
+#include <linux/err.h>
 
-/**
- * A few values needed by the userspace governor
- */
-static DEFINE_PER_CPU(unsigned int, cpu_max_freq);
-static DEFINE_PER_CPU(unsigned int, cpu_min_freq);
-static DEFINE_PER_CPU(unsigned int, cpu_cur_freq); /* current CPU freq */
-static DEFINE_PER_CPU(unsigned int, cpu_set_freq); /* CPU freq desired by
-							userspace */
-static DEFINE_PER_CPU(unsigned int, cpu_is_managed);
-
-static DEFINE_MUTEX(userspace_mutex);
-static int cpus_using_userspace_governor;
-
-/* keep track of frequency transitions */
-static int
-userspace_cpufreq_notifier(struct notifier_block *nb, unsigned long val,
-	void *data)
-{
-	struct cpufreq_freqs *freq = data;
-
-	if (!per_cpu(cpu_is_managed, freq->cpu))
-		return 0;
-
-	if (val == CPUFREQ_POSTCHANGE) {
-		pr_debug("saving cpu_cur_freq of cpu %u to be %u kHz\n",
-				freq->cpu, freq->new);
-		per_cpu(cpu_cur_freq, freq->cpu) = freq->new;
-	}
-
-	return 0;
-}
-
-static struct notifier_block userspace_cpufreq_notifier_block = {
-	.notifier_call  = userspace_cpufreq_notifier
+struct us_cpu_info_s {
+	bool cpu_is_managed;
+	u32 cpu_max_freq;
+	u32 cpu_min_freq;
+	u32 cpu_cur_freq;
+	u32 cpu_set_freq;
 };
+static DEFINE_PER_CPU(struct us_cpu_info_s, us_cpu_info);
 
+/* Number of CPUs that currently use this governor */
+static u32 gov_enable_cnt;
+
+/* userspace_mutex protects governor frequency transitions */
+static DEFINE_MUTEX(userspace_mutex);
 
 /**
- * cpufreq_set - set the CPU frequency
- * @policy: pointer to policy struct where freq is being set
- * @freq: target frequency in kHz
+ * set_speed() - set the CPU frequency to a passed value.
+ * @policy: pointer to cpufreq policy, where frequency is being set.
+ * @freq: target frequency in kHz.
  *
- * Sets the CPU frequency to freq.
+ * Sets the CPU frequency to a passed value aligning to frequency limits.
  */
-static int cpufreq_set(struct cpufreq_policy *policy, unsigned int freq)
+static int set_speed(struct cpufreq_policy *policy, u32 freq)
 {
+	struct us_cpu_info_s *info = &per_cpu(us_cpu_info, policy->cpu);
 	int ret = -EINVAL;
 
-	pr_debug("cpufreq_set for cpu %u, freq %u kHz\n", policy->cpu, freq);
-
 	mutex_lock(&userspace_mutex);
-	if (!per_cpu(cpu_is_managed, policy->cpu))
+	if (!info->cpu_is_managed)
 		goto err;
 
-	per_cpu(cpu_set_freq, policy->cpu) = freq;
+	pr_debug("%s for cpu%u, freq -> %ukHz\n", __func__, policy->cpu, freq);
 
-	if (freq < per_cpu(cpu_min_freq, policy->cpu))
-		freq = per_cpu(cpu_min_freq, policy->cpu);
-	if (freq > per_cpu(cpu_max_freq, policy->cpu))
-		freq = per_cpu(cpu_max_freq, policy->cpu);
+	freq = min(max(freq, info->cpu_min_freq), info->cpu_max_freq);
+	info->cpu_set_freq = freq;
 
 	/*
-	 * We're safe from concurrent calls to ->target() here
-	 * as we hold the userspace_mutex lock. If we were calling
-	 * cpufreq_driver_target, a deadlock situation might occur:
-	 * A: cpufreq_set (lock userspace_mutex) ->
-	 *      cpufreq_driver_target(lock policy->lock)
-	 * B: cpufreq_set_policy(lock policy->lock) ->
+	 * We're safe from concurrent calls to ->target() here as we hold the
+	 * userspace_mutex lock.  If we were calling cpufreq_driver_target, a
+	 * deadlock situation might occur:
+	 * A: set_speed (lock userspace_mutex) ->
+	 *      cpufreq_driver_target(lock policy->lock).
+	 * B: set_speed_policy(lock policy->lock) ->
 	 *      __cpufreq_governor ->
-	 *         cpufreq_governor_userspace (lock userspace_mutex)
+	 *          cpufreq_governor_algorithm (lock userspace_mutex).
 	 */
 	ret = __cpufreq_driver_target(policy, freq, CPUFREQ_RELATION_L);
 
- err:
+err:
 	mutex_unlock(&userspace_mutex);
+
 	return ret;
 }
 
-
+/**
+ * show_speed() - return a saved current frequency of a CPU.
+ * @policy: pointer to cpufreq policy, where frequency was set.
+ * @buf: buffer for returnable data.
+ *
+ * Returns userspace current frequency of a CPU.
+ */
 static ssize_t show_speed(struct cpufreq_policy *policy, char *buf)
 {
-	return sprintf(buf, "%u\n", per_cpu(cpu_cur_freq, policy->cpu));
+	struct us_cpu_info_s *info = &per_cpu(us_cpu_info, policy->cpu);
+
+	return scnprintf(buf, sizeof(u32) * 8 + 1, "%u\n", info->cpu_cur_freq);
 }
 
-static int cpufreq_governor_userspace(struct cpufreq_policy *policy,
-				   unsigned int event)
+static int cpufreq_notifier(struct notifier_block *nb,
+			    unsigned long val, void *data)
 {
-	unsigned int cpu = policy->cpu;
-	int rc = 0;
+	struct cpufreq_freqs *freq = data;
+	struct us_cpu_info_s *info = &per_cpu(us_cpu_info, freq->cpu);
+
+	if (!info->cpu_is_managed || val != CPUFREQ_POSTCHANGE)
+		return NOTIFY_OK;
+
+	pr_debug("saving cpu_cur_freq of cpu%u to be%u kHz\n",
+		  freq->cpu, freq->new);
+	info->cpu_cur_freq = freq->new;
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block cpufreq_notifier_block = {
+	.notifier_call = cpufreq_notifier,
+};
+
+static int cpufreq_governor_algorithm(struct cpufreq_policy *policy,
+				      unsigned int event)
+{
+	int ret;
+	u32 cpu = policy->cpu;
+	struct us_cpu_info_s *info = &per_cpu(us_cpu_info, cpu);
 
 	switch (event) {
 	case CPUFREQ_GOV_START:
-		if (!cpu_online(cpu))
+		if (!cpu_online(cpu) || !policy->cur)
 			return -EINVAL;
-		BUG_ON(!policy->cur);
+
 		mutex_lock(&userspace_mutex);
+		if (++gov_enable_cnt != 1)
+			goto skip_init;
 
-		if (cpus_using_userspace_governor == 0) {
-			cpufreq_register_notifier(
-					&userspace_cpufreq_notifier_block,
-					CPUFREQ_TRANSITION_NOTIFIER);
+		ret = cpufreq_register_notifier(&cpufreq_notifier_block,
+						CPUFREQ_TRANSITION_NOTIFIER);
+		if (IS_ERR_VALUE(ret)) {
+			pr_err("unable to register cpufreq notifier\n");
+			mutex_unlock(&userspace_mutex);
+			return ret;
 		}
-		cpus_using_userspace_governor++;
 
-		per_cpu(cpu_is_managed, cpu) = 1;
-		per_cpu(cpu_min_freq, cpu) = policy->min;
-		per_cpu(cpu_max_freq, cpu) = policy->max;
-		per_cpu(cpu_cur_freq, cpu) = policy->cur;
-		per_cpu(cpu_set_freq, cpu) = policy->cur;
-		pr_debug("managing cpu %u started "
-			"(%u - %u kHz, currently %u kHz)\n",
-				cpu,
-				per_cpu(cpu_min_freq, cpu),
-				per_cpu(cpu_max_freq, cpu),
-				per_cpu(cpu_cur_freq, cpu));
+skip_init:
+		info->cpu_min_freq = policy->min;
+		info->cpu_max_freq = policy->max;
+		info->cpu_cur_freq = info->cpu_set_freq = policy->cur;
+		info->cpu_is_managed = true;
 
+		pr_debug("cpu%u started to use userspace policy "
+			 "(%u - %ukHz, currently %ukHz)\n", cpu,
+			 info->cpu_min_freq,
+			 info->cpu_max_freq,
+			 info->cpu_cur_freq);
 		mutex_unlock(&userspace_mutex);
 		break;
 	case CPUFREQ_GOV_STOP:
 		mutex_lock(&userspace_mutex);
-		cpus_using_userspace_governor--;
-		if (cpus_using_userspace_governor == 0) {
-			cpufreq_unregister_notifier(
-					&userspace_cpufreq_notifier_block,
-					CPUFREQ_TRANSITION_NOTIFIER);
-		}
+		info->cpu_is_managed = false;
 
-		per_cpu(cpu_is_managed, cpu) = 0;
-		per_cpu(cpu_min_freq, cpu) = 0;
-		per_cpu(cpu_max_freq, cpu) = 0;
-		per_cpu(cpu_set_freq, cpu) = 0;
-		pr_debug("managing cpu %u stopped\n", cpu);
+		if (--gov_enable_cnt != 0)
+			goto skip_exit;
+
+		cpufreq_unregister_notifier(&cpufreq_notifier_block,
+					    CPUFREQ_TRANSITION_NOTIFIER);
+
+skip_exit:
+		info->cpu_min_freq = info->cpu_max_freq = 0;
+		info->cpu_cur_freq = info->cpu_set_freq = 0;
+
+		pr_debug("cpu%u stopped to use userspace policy\n", cpu);
 		mutex_unlock(&userspace_mutex);
 		break;
 	case CPUFREQ_GOV_LIMITS:
 		mutex_lock(&userspace_mutex);
-		pr_debug("limit event for cpu %u: %u - %u kHz, "
-			"currently %u kHz, last set to %u kHz\n",
-			cpu, policy->min, policy->max,
-			per_cpu(cpu_cur_freq, cpu),
-			per_cpu(cpu_set_freq, cpu));
-		if (policy->max < per_cpu(cpu_set_freq, cpu)) {
+		pr_debug("limit event for cpu%u: %u - %ukHz, "
+			 "currently %ukHz, last set to %ukHz\n",
+			 cpu, policy->min, policy->max,
+			 info->cpu_cur_freq,
+			 info->cpu_set_freq);
+
+		if (info->cpu_set_freq > policy->max)
 			__cpufreq_driver_target(policy, policy->max,
 						CPUFREQ_RELATION_H);
-		} else if (policy->min > per_cpu(cpu_set_freq, cpu)) {
+		else if (info->cpu_set_freq < policy->min)
 			__cpufreq_driver_target(policy, policy->min,
 						CPUFREQ_RELATION_L);
-		} else {
-			__cpufreq_driver_target(policy,
-						per_cpu(cpu_set_freq, cpu),
+		else
+			__cpufreq_driver_target(policy, info->cpu_set_freq,
 						CPUFREQ_RELATION_L);
-		}
-		per_cpu(cpu_min_freq, cpu) = policy->min;
-		per_cpu(cpu_max_freq, cpu) = policy->max;
-		per_cpu(cpu_cur_freq, cpu) = policy->cur;
+
+		info->cpu_min_freq = policy->min;
+		info->cpu_max_freq = policy->max;
+		info->cpu_cur_freq = policy->cur;
 		mutex_unlock(&userspace_mutex);
 		break;
 	}
-	return rc;
-}
 
+	return 0;
+}
 
 #ifndef CONFIG_CPU_FREQ_DEFAULT_GOV_USERSPACE
 static
 #endif
 struct cpufreq_governor cpufreq_gov_userspace = {
 	.name		= "userspace",
-	.governor	= cpufreq_governor_userspace,
-	.store_setspeed	= cpufreq_set,
+	.governor	= cpufreq_governor_algorithm,
+	.store_setspeed	= set_speed,
 	.show_setspeed	= show_speed,
 	.owner		= THIS_MODULE,
 };
 
-static int __init cpufreq_gov_userspace_init(void)
+static int __init cpufreq_governor_init(void)
 {
 	return cpufreq_register_governor(&cpufreq_gov_userspace);
 }
 
-
-static void __exit cpufreq_gov_userspace_exit(void)
+static void __exit cpufreq_governor_exit(void)
 {
 	cpufreq_unregister_governor(&cpufreq_gov_userspace);
 }
 
+#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_USERSPACE
+fs_initcall(cpufreq_governor_init);
+#else
+module_init(cpufreq_governor_init);
+#endif
+module_exit(cpufreq_governor_exit);
 
 MODULE_AUTHOR("Dominik Brodowski <linux@brodo.de>, "
-		"Russell King <rmk@arm.linux.org.uk>");
+	      "Russell King <rmk@arm.linux.org.uk>");
 MODULE_DESCRIPTION("CPUfreq policy governor 'userspace'");
-MODULE_LICENSE("GPL");
-
-#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_USERSPACE
-fs_initcall(cpufreq_gov_userspace_init);
-#else
-module_init(cpufreq_gov_userspace_init);
-#endif
-module_exit(cpufreq_gov_userspace_exit);
+MODULE_LICENSE("GPLv2");
