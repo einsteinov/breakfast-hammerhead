@@ -316,7 +316,7 @@ static int bl_set_intensity(struct backlight_device *bd)
 
 static int bl_get_intensity(struct backlight_device *bd)
 {
-	return bd->props.brightness;
+	return min(bd->props.brightness, bd->props.max_brightness);
 }
 
 static ssize_t lcd_backlight_show_level(struct device *dev,
@@ -350,6 +350,69 @@ static ssize_t lcd_backlight_store_level(struct device *dev,
 
 DEVICE_ATTR(lm3630_level, 0644, lcd_backlight_show_level,
 		lcd_backlight_store_level);
+
+static ssize_t lcd_backlight_show_min_level(struct device *dev,
+					    struct device_attribute *attr,
+					    char *buf)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct lm3630_device *lm3630 = i2c_get_clientdata(client);
+
+	return scnprintf(buf, PAGE_SIZE, "LCD Backlight Min Level is : %d\n",
+			 lm3630->min_brightness);
+}
+
+static ssize_t lcd_backlight_store_min_level(struct device *dev,
+					     struct device_attribute *attr,
+					     const char *buf, size_t count)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct lm3630_device *lm3630 = i2c_get_clientdata(client);
+	int ret, val, down_limit = lm3630->blmap ? lm3630->blmap[0] : 1;
+
+	ret = kstrtoint(buf, 10, &val);
+	if (ret || val < down_limit || val > lm3630->max_brightness)
+		return -EINVAL;
+
+	lm3630->min_brightness = val;
+
+	return count;
+}
+
+static DEVICE_ATTR(lm3630_min_level, S_IRUGO | S_IWUSR,
+		lcd_backlight_show_min_level, lcd_backlight_store_min_level);
+
+static ssize_t lcd_backlight_show_max_level(struct device *dev,
+					    struct device_attribute *attr,
+					    char *buf)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct lm3630_device *lm3630 = i2c_get_clientdata(client);
+
+	return scnprintf(buf, PAGE_SIZE, "LCD Backlight Max Level is : %d\n",
+			 lm3630->max_brightness);
+}
+
+static ssize_t lcd_backlight_store_max_level(struct device *dev,
+					     struct device_attribute *attr,
+					     const char *buf, size_t count)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct lm3630_device *lm3630 = i2c_get_clientdata(client);
+	int ret, val;
+
+	ret = kstrtoint(buf, 10, &val);
+	if (ret || val < lm3630->min_brightness || val > 0xFF)
+		return -EINVAL;
+
+	lm3630->max_brightness = val;
+	lm3630->bl_dev->props.max_brightness = val;
+
+	return count;
+}
+
+static DEVICE_ATTR(lm3630_max_level, S_IRUGO | S_IWUSR,
+		lcd_backlight_show_max_level, lcd_backlight_store_max_level);
 
 static int lm3630_create_debugfs_entries(struct lm3630_device *chip)
 {
@@ -633,8 +696,9 @@ static int lm3630_probe(struct i2c_client *client,
 		}
 	}
 
-	ret = device_create_file(&client->dev,
-			&dev_attr_lm3630_level);
+	ret  = device_create_file(&client->dev, &dev_attr_lm3630_level);
+	ret |= device_create_file(&client->dev, &dev_attr_lm3630_min_level);
+	ret |= device_create_file(&client->dev, &dev_attr_lm3630_max_level);
 	if (ret) {
 		pr_err("%s: failed to create sysfs level\n", __func__);
 		goto err_create_sysfs_level;
@@ -652,6 +716,8 @@ static int lm3630_probe(struct i2c_client *client,
 	return 0;
 
 err_create_debugfs:
+	device_remove_file(&client->dev, &dev_attr_lm3630_max_level);
+	device_remove_file(&client->dev, &dev_attr_lm3630_min_level);
 	device_remove_file(&client->dev, &dev_attr_lm3630_level);
 err_create_sysfs_level:
 	if (gpio_is_valid(dev->en_gpio))
@@ -673,6 +739,8 @@ static int lm3630_remove(struct i2c_client *client)
 	lm3630_dev = NULL;
 	if (dev->dent)
 		debugfs_remove_recursive(dev->dent);
+	device_remove_file(&client->dev, &dev_attr_lm3630_max_level);
+	device_remove_file(&client->dev, &dev_attr_lm3630_min_level);
 	device_remove_file(&client->dev, &dev_attr_lm3630_level);
 	i2c_set_clientdata(client, NULL);
 	if (gpio_is_valid(dev->en_gpio))
