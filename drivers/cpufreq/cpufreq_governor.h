@@ -259,8 +259,6 @@ struct od_dbs_tuners {
 	u32 up_threshold;
 	u32 up_threshold_multi_core;
 	u32 up_threshold_any_cpu_load;
-	u32 down_differential;
-	u32 down_differential_multi_core;
 	u32 io_is_busy:1;
 	u32 sync_on_migrate:1;
 	u32 sync_freq;

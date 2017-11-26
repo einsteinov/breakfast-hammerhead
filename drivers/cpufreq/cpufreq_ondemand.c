@@ -17,11 +17,9 @@
 #include "cpufreq_governor.h"
 
 #define DEF_FREQUENCY_UP_THRESHOLD		(80)
-#define DEF_FREQUENCY_DOWN_DIFFERENTIAL		(10)
 #define DEF_FREQUENCY_SYNCHRONIZATION		(1)
 #define DEF_SAMPLING_DOWN_FACTOR		(1)
 #define MICRO_FREQUENCY_UP_THRESHOLD		(95)
-#define MICRO_FREQUENCY_DOWN_DIFFERENTIAL	(3)
 
 struct dbs_work_struct {
 	struct work_struct work;
@@ -37,18 +35,15 @@ static struct od_dbs_tuners od_tuners = {
 	.up_threshold = DEF_FREQUENCY_UP_THRESHOLD,
 	.up_threshold_multi_core = DEF_FREQUENCY_UP_THRESHOLD,
 	.up_threshold_any_cpu_load = DEF_FREQUENCY_UP_THRESHOLD,
-	.down_differential = DEF_FREQUENCY_DOWN_DIFFERENTIAL,
-	.down_differential_multi_core = MICRO_FREQUENCY_DOWN_DIFFERENTIAL,
 	.sync_on_migrate = DEF_FREQUENCY_SYNCHRONIZATION,
 	.sync_freq = 0,
 	.optimal_freq = 0,
 	.input_boost_freq = 0,
 };
 
-static inline u32 get_policy_max_load_freq(struct cpufreq_policy *policy)
+static inline u32 get_policy_max_load(struct cpufreq_policy *policy)
 {
-	u32 max_load_freq = 0, cur_load, freq_avg, load_freq, j;
-	u32 load_at_max_freq;
+	u32 max_load = 0, cur_load, load_at_max_freq, j;
 
 	for_each_cpu(j, policy->cpus) {
 		struct cpu_dbs_common_info *j_cdbs = get_cpu_cdbs(j);
@@ -69,22 +64,16 @@ static inline u32 get_policy_max_load_freq(struct cpufreq_policy *policy)
 			continue;
 
 		cur_load = 100 * (wall_time - idle_time) / wall_time;
-
-		freq_avg = __cpufreq_driver_getavg(policy, j);
-		if (freq_avg <= 0)
-			freq_avg = policy->cur;
-
-		load_freq = cur_load * freq_avg;
-		max_load_freq = max(max_load_freq, load_freq);
+		max_load = max(max_load, cur_load);
 
 		j_dbs_info->max_load  = max(cur_load, j_dbs_info->prev_load);
 		j_dbs_info->prev_load = cur_load;
 	}
 
-	load_at_max_freq = max_load_freq / policy->max;
+	load_at_max_freq = max_load * policy->cur / policy->max;
 	cpufreq_notify_utilization(policy, load_at_max_freq);
 
-	return max_load_freq;
+	return max_load;
 }
 
 static inline u32 get_other_cpu_max_load(struct cpufreq_policy *policy)
@@ -128,16 +117,20 @@ static inline void dbs_freq_increase(struct cpufreq_policy *policy, u32 freq)
 static void od_check_cpu(struct od_cpu_dbs_info_s *dbs_info)
 {
 	struct cpufreq_policy *policy = dbs_info->cdbs.cur_policy;
-	u32 max_load_freq = get_policy_max_load_freq(policy);
+	u32 max_load = get_policy_max_load(policy);
 	u32 max_load_other_cpu = get_other_cpu_max_load(policy);
+	u32 freq_next, min_freq = policy->min, max_freq = policy->max;
 
-	if (max_load_freq > od_tuners.up_threshold * policy->cur) {
+	if (max_load >= od_tuners.up_threshold) {
 		if (policy->cur < policy->max)
 			dbs_info->rate_mult = od_tuners.sampling_down_factor;
 
 		dbs_freq_increase(policy, policy->max);
 		return;
 	}
+
+	/* No longer fully busy, reset rate_mult */
+	dbs_info->rate_mult = 1;
 
 	if (num_online_cpus() > 1) {
 		if (max_load_other_cpu > od_tuners.up_threshold_any_cpu_load) {
@@ -146,8 +139,7 @@ static void od_check_cpu(struct od_cpu_dbs_info_s *dbs_info)
 			return;
 		}
 
-		if (max_load_freq > od_tuners.up_threshold_multi_core *
-		    policy->cur) {
+		if (max_load >= od_tuners.up_threshold_multi_core) {
 			if (policy->cur < od_tuners.optimal_freq)
 				dbs_freq_increase(policy,
 					od_tuners.optimal_freq);
@@ -155,46 +147,8 @@ static void od_check_cpu(struct od_cpu_dbs_info_s *dbs_info)
 		}
 	}
 
-	/*
-	 * Check for frequency decrease.
-	 * If we cannot reduce the frequency anymore, break out early.
-	 */
-	if (policy->cur == policy->min)
-		return;
-
-	/*
-	 * The optimal frequency is the frequency that is the lowest that
-	 * can support the current CPU usage without triggering the up
-	 * policy.
-	 */
-	if (max_load_freq <
-	   (od_tuners.up_threshold - od_tuners.down_differential) *
-	    policy->cur) {
-		u32 freq_next;
-
-		freq_next = max_load_freq / (od_tuners.up_threshold -
-					     od_tuners.down_differential);
-		freq_next = max(freq_next, policy->min);
-
-		/* No longer fully busy, reset rate_mult */
-		dbs_info->rate_mult = 1;
-
-		if (num_online_cpus() > 1) {
-			if (max_load_other_cpu >
-			    od_tuners.up_threshold_multi_core -
-			    od_tuners.down_differential &&
-			    freq_next < od_tuners.sync_freq)
-				freq_next = od_tuners.sync_freq;
-
-			if (max_load_freq >
-			   (od_tuners.up_threshold_multi_core -
-			    od_tuners.down_differential_multi_core) *
-			    policy->cur && freq_next < od_tuners.optimal_freq)
-				freq_next = od_tuners.optimal_freq;
-		}
-
-		__cpufreq_driver_target(policy, freq_next, CPUFREQ_RELATION_C);
-	}
+	freq_next = min_freq + max_load * (max_freq - min_freq) / 100;
+	__cpufreq_driver_target(policy, freq_next, CPUFREQ_RELATION_C);
 }
 
 static int dbs_migration_notify(struct notifier_block *nb,
@@ -412,8 +366,6 @@ define_one_dbs_node(od, sampling_rate, min_sampling_rate, UINT_MAX);
 define_one_dbs_node(od, up_threshold, 1, 100);
 define_one_dbs_node(od, up_threshold_multi_core, 1, 100);
 define_one_dbs_node(od, up_threshold_any_cpu_load, 1, 100);
-define_one_dbs_node(od, down_differential, 1, 100);
-define_one_dbs_node(od, down_differential_multi_core, 1, 100);
 define_one_dbs_node(od, io_is_busy, 0, 1);
 define_one_dbs_node(od, sync_on_migrate, 0, 1);
 define_one_dbs_node(od, sync_freq, 0, UINT_MAX);
@@ -427,8 +379,6 @@ static struct attribute *dbs_attributes[] = {
 	&up_threshold.attr,
 	&up_threshold_multi_core.attr,
 	&up_threshold_any_cpu_load.attr,
-	&down_differential.attr,
-	&down_differential_multi_core.attr,
 	&io_is_busy.attr,
 	&sync_on_migrate.attr,
 	&sync_freq.attr,
@@ -641,7 +591,6 @@ static int __init cpufreq_gov_dbs_init(void)
 	 */
 	if (nohz_sampling_rate_is_used()) {
 		od_tuners.up_threshold = MICRO_FREQUENCY_UP_THRESHOLD;
-		od_tuners.down_differential = MICRO_FREQUENCY_DOWN_DIFFERENTIAL;
 		min_sampling_rate = MICRO_FREQUENCY_MIN_SAMPLE_RATE;
 	} else {
 		min_sampling_rate = sampling_rate_by_jiffies();
