@@ -625,6 +625,71 @@ static struct acpuclk_data acpuclk_krait_data = {
 	.get_rate = acpuclk_krait_get_rate,
 };
 
+/**
+ * acpuclk_krait_freq_get_vdd() - return CPUFreq->VDD table.
+ * @buf: buffer to store the data.
+ *
+ * This function may be used by cpufreq framework to print voltage level
+ * corresponding to used frequency.  This could be useful while tracing
+ * the cpu stability using different voltage levels for each frequency.
+ */
+ssize_t acpuclk_krait_freq_get_vdd(char *buf)
+{
+	ssize_t len = 0;
+	int i;
+
+	mutex_lock(&driver_lock);
+	for (i = 0; drv.acpu_freq_tbl[i].speed.khz != 0; i++) {
+		if (drv.acpu_freq_tbl[i].use_for_scaling) {
+			len += scnprintf(buf + len, sizeof(u64) * 16,
+					 "%lumhz: %d mV\n",
+					 drv.acpu_freq_tbl[i].speed.khz / 1000,
+					 drv.acpu_freq_tbl[i].vdd_core / 1000);
+		}
+	}
+	mutex_unlock(&driver_lock);
+
+	return len;
+}
+EXPORT_SYMBOL_GPL(acpuclk_krait_freq_get_vdd);
+
+/**
+ * acpuclk_krait_freq_set_vdd() - set a voltage level to a corresponding cpu
+ * frequency.
+ * @buf: buffer to store the data.
+ *
+ * This function may be used by cpufreq framework to store voltage level
+ * corresponding to used frequency.  This could be useful while tracing
+ * the cpu stability using different voltage levels for each frequency.
+ */
+ssize_t acpuclk_krait_freq_set_vdd(const char *buf)
+{
+	struct scalable *sc = &drv.scalable[CPU0];
+	const int max_vdd = sc->vreg[VREG_CORE].max_vdd / 1000;
+	int ret, val, i;
+	char len[5];
+
+	mutex_lock(&driver_lock);
+	for (i = 0; drv.acpu_freq_tbl[i].speed.khz != 0; i++) {
+		if (drv.acpu_freq_tbl[i].use_for_scaling) {
+			ret = sscanf(buf, "%d\n", &val);
+			if (ret != 1 || val < 0 || val > max_vdd) {
+				mutex_unlock(&driver_lock);
+				return -EINVAL;
+			}
+
+			drv.acpu_freq_tbl[i].vdd_core = val * 1000;
+
+			sscanf(buf, "%s", len);
+			buf += strlen(len) + 1;
+		}
+	}
+	mutex_unlock(&driver_lock);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(acpuclk_krait_freq_set_vdd);
+
 /* Initialize a HFPLL at a given rate and enable it. */
 static void __cpuinit hfpll_init(struct scalable *sc,
 			      const struct core_speed *tgt_s)
