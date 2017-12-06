@@ -66,6 +66,15 @@
 	.private_value = (unsigned long)&(struct soc_mixer_control) \
 		{.reg = xreg, .min = xmin, .max = xmax, \
 		 .platform_max = xmax} }
+#define SOC_SINGLE_S8_TLV_RO(xname, xreg, xmin, xmax, tlv_array) \
+{	.iface  = SNDRV_CTL_ELEM_IFACE_MIXER, .name = (xname), \
+	.access = SNDRV_CTL_ELEM_ACCESS_TLV_READ, \
+	.tlv.p  = (tlv_array), \
+	.info   = snd_soc_info_volsw_s8, .get = snd_soc_get_volsw_s8, \
+	.put    = snd_soc_put_volsw_s8, \
+	.private_value = (unsigned long)&(struct soc_mixer_control) \
+		{.reg = xreg, .min = xmin, .max = xmax, \
+		 .platform_max = xmax} }
 #define SOC_DOUBLE(xname, reg, shift_left, shift_right, max, invert) \
 {	.iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = (xname),\
 	.info = snd_soc_info_volsw, .get = snd_soc_get_volsw, \
