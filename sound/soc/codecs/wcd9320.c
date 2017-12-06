@@ -23,6 +23,7 @@
 #include <linux/mfd/wcd9xxx/core.h>
 #include <linux/mfd/wcd9xxx/wcd9xxx_registers.h>
 #include <linux/mfd/wcd9xxx/wcd9320_registers.h>
+#include <linux/mfd/wcd9xxx/wcd9xxx-snd-ctrl.h>
 #include <linux/mfd/wcd9xxx/pdata.h>
 #include <linux/regulator/consumer.h>
 #include <sound/pcm.h>
@@ -466,6 +467,7 @@ static const u32 vport_i2s_check_table[NUM_CODEC_DAIS] = {
 
 struct taiko_priv {
 	struct snd_soc_codec *codec;
+	struct snd_ctrl_data *ctrl_data;
 	u32 adc_count;
 	u32 rx_bias_count;
 	s32 dmic_1_2_clk_cnt;
@@ -6572,6 +6574,32 @@ static int taiko_codec_probe(struct snd_soc_codec *codec)
 		goto err_pdata;
 	}
 
+	taiko->ctrl_data = kzalloc(sizeof(*taiko->ctrl_data), GFP_KERNEL);
+	if (IS_ERR_OR_NULL(taiko->ctrl_data)) {
+		dev_err(codec->dev, "Failed to allocate control data\n");
+		goto fail_ctrl;
+	}
+
+	taiko->ctrl_data->codec = codec;
+	taiko->ctrl_data->name = codec->name;
+	taiko->ctrl_data->codec_read = &taiko_read;
+	taiko->ctrl_data->codec_write = &taiko_write;
+#ifdef CONFIG_MACH_MSM8974_HAMMERHEAD
+	taiko->ctrl_data->mic_line = TAIKO_A_CDC_TX7_VOL_CTL_GAIN;
+	taiko->ctrl_data->cam_mic_line = TAIKO_A_CDC_TX6_VOL_CTL_GAIN;
+	taiko->ctrl_data->headphone_l_line = TAIKO_A_CDC_RX1_VOL_CTL_B2_CTL;
+	taiko->ctrl_data->headphone_r_line = TAIKO_A_CDC_RX2_VOL_CTL_B2_CTL;
+	taiko->ctrl_data->speaker_l_line = TAIKO_A_CDC_RX7_VOL_CTL_B2_CTL;
+	taiko->ctrl_data->speaker_r_line = TAIKO_A_CDC_RX7_VOL_CTL_B2_CTL;
+#endif
+
+	ret = snd_ctrl_register(taiko->ctrl_data);
+	if (IS_ERR_VALUE(ret)) {
+		pr_err("%s: unable to register control data\n", __func__);
+		kfree(taiko->ctrl_data);
+	}
+
+fail_ctrl:
 	taiko->spkdrv_reg = taiko_codec_find_regulator(codec,
 						       WCD9XXX_VDD_SPKDRV_NAME);
 
@@ -6665,6 +6693,7 @@ err_irq:
 err_pdata:
 	kfree(ptr);
 err_nomem_slimch:
+	kfree(taiko->ctrl_data);
 	kfree(taiko);
 err_init:
 	return ret;
@@ -6690,6 +6719,9 @@ static int taiko_codec_remove(struct snd_soc_codec *codec)
 
 	taiko->spkdrv_reg = NULL;
 
+	snd_ctrl_unregister(taiko->ctrl_data);
+
+	kfree(taiko->ctrl_data);
 	kfree(taiko);
 	return 0;
 }
